@@ -1,0 +1,15 @@
+# MCP SDK
+mcp>=1.0.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# Azure SDK packages
+azure-identity>=1.15.0
+azure-mgmt-compute>=30.0.0
+azure-mgmt-network>=25.0.0
+azure-mgmt-resource>=23.0.0
+
+# Async support
+aiohttp>=3.9.0
+
+python-dotenv
