@@ -42,15 +42,30 @@ python test.py
 Verifies that all required packages are installed and environment variables are configured.
 
 ### Running the MCP Server
+
+**stdio mode (default):**
 ```powershell
 python custom_azure_mcp.py
+# or explicitly
+python custom_azure_mcp.py --transport stdio
 ```
-Starts the MCP server with stdio communication for Azure operations.
+
+**HTTP mode:**
+```powershell
+# Default (localhost:8000)
+python custom_azure_mcp.py --transport http
+
+# Custom host/port
+python custom_azure_mcp.py --transport http --host 0.0.0.0 --port 8001
+```
 
 ### Development Testing
 ```powershell
-# Test VM deployment (example)
-# Requires MCP client to call tools - server runs via stdio
+# Test server startup
+python custom_azure_mcp.py --help
+
+# Test HTTP server (accessible via browser/curl at http://localhost:8000)
+python custom_azure_mcp.py --transport http
 ```
 
 ## Architecture
@@ -70,10 +85,11 @@ Starts the MCP server with stdio communication for Azure operations.
 
 ### Implementation Architecture
 
-#### Modular Design
-- **CustomAzureMCPServer** - Main server orchestrator
-- **VirtualMachineManager** - Handles all VM operations
-- Future modules planned for disk management, storage operations
+#### Core Design
+- **FastMCP-based** - Uses MCP SDK's FastMCP class for dual transport support
+- **Global Azure credentials** - Shared authentication across all tools
+- **Decorator-based tools** - Each Azure operation is a `@app.tool()` decorated function
+- **Dual transport** - Same tools work with both stdio and HTTP transports
 
 #### Available MCP Tools
 
@@ -94,25 +110,29 @@ Starts the MCP server with stdio communication for Azure operations.
 - Public IP assignment for remote access
 
 #### Communication
-- Uses stdio for MCP client communication
+- **Dual transport**: stdio (for IDE integration) or HTTP (for web clients)
+- **stdio**: Direct process communication via stdin/stdout
+- **HTTP**: RESTful API on configurable host/port with streamable HTTP transport
 - Async operations for all Azure API calls
 - Detailed logging to stderr for debugging
 - Structured error handling with user-friendly messages
 
 ## Extending the Server
 
-### Adding New Resource Managers
-1. Create new manager class (e.g., `DiskManager`, `StorageManager`)
-2. Implement `get_tools()` method returning list of `Tool` objects
-3. Add async methods for each tool operation
-4. Register manager in `CustomAzureMCPServer._setup_handlers()`
-5. Add tool routing in the `call_tool()` handler
+### Adding New Tools (FastMCP Pattern)
+1. Create new async function with proper type hints
+2. Add `@app.tool()` decorator
+3. Include comprehensive docstring describing the tool
+4. For HTTP transport, register tool with `http_app.add_tool(your_function)`
+5. Return string results (not TextContent objects)
 
 ### Tool Implementation Pattern
-- Each tool has clear input schema with required/optional parameters
-- Async methods return `List[TextContent]` with operation results
-- Error handling with user-friendly messages and stderr logging
-- Success messages include relevant resource details
+- Use `@app.tool()` decorator on async functions
+- Function parameters become tool input schema automatically
+- Use type hints for parameter validation
+- Return strings (success/error messages)
+- Access global `azure_creds` for Azure operations
+- Log progress to stderr for debugging
 
 ## Security Notes
 - Azure credentials are stored in `.env` - ensure this file is never committed

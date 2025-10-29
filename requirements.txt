@@ -12,4 +12,9 @@ azure-mgmt-resource>=23.0.0
 # Async support
 aiohttp>=3.9.0
 
+# HTTP transport support
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# Environment variables
 python-dotenv
