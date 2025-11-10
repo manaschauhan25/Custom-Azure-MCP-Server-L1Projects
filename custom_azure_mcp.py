@@ -6,6 +6,7 @@ Dual-transport architecture supporting both stdio and HTTP
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -425,6 +426,205 @@ fi
 
 
 @app.tool()
+async def get_process_utilization(
+    resource_group: str,
+    vm_name: str,
+    os_type: str = "windows",
+    sample_seconds: int = 5,
+    top_n: int = 15
+) -> str:
+    """
+    Get top CPU and Memory consuming processes on an Azure VM
+    
+    Args:
+        resource_group: Resource group containing the VM
+        vm_name: Name of the virtual machine
+        os_type: Operating system type - 'windows' or 'linux' (default: windows)
+        sample_seconds: Sampling period in seconds (default: 5)
+        top_n: Number of top processes to return (default: 15)
+        
+    Returns:
+        JSON string with process utilization data
+    """
+    if not azure_creds:
+        return json.dumps({"error": "Azure credentials not initialized", "success": False})
+        
+    if not resource_group or not vm_name:
+        return json.dumps({"error": "resource_group and vm_name are required", "success": False})
+    
+    if os_type.lower() not in ["windows", "linux"]:
+        return json.dumps({"error": "os_type must be 'windows' or 'linux'", "success": False})
+    
+    try:
+        logger.info(f"Getting process utilization for VM: {vm_name}")
+        
+        # Build appropriate script based on OS type
+        if os_type.lower() == "windows":
+            # Windows PowerShell script
+            script = f"""
+$SampleSeconds = {sample_seconds}
+$TopN = {top_n}
+
+# Step 1: First snapshot
+$proc1 = Get-Process | Select-Object Id, Name, CPU, WorkingSet64
+
+Start-Sleep -Seconds $SampleSeconds
+
+# Step 2: Second snapshot
+$proc2 = Get-Process | Select-Object Id, Name, CPU, WorkingSet64
+
+# Step 3: System resource details
+$cpuCount = (Get-WmiObject Win32_ComputerSystem).NumberOfLogicalProcessors
+$totalMem = (Get-WmiObject Win32_OperatingSystem).TotalVisibleMemorySize * 1KB
+
+# Step 4: Compute CPU & Memory%
+$result = foreach ($p2 in $proc2) {{
+    $p1 = $proc1 | Where-Object {{ $_.Id -eq $p2.Id }}
+    if ($p1 -and $p2.CPU -ne $null) {{
+        $cpuDelta = ($p2.CPU - $p1.CPU)
+        $cpuPct = [math]::Round(($cpuDelta / $SampleSeconds / $cpuCount) * 100, 2)
+        $memPct = [math]::Round(($p2.WorkingSet64 / $totalMem) * 100, 2)
+        [PSCustomObject]@{{
+            process_name = $p2.Name
+            pid = $p2.Id
+            cpu_percent = $cpuPct
+            memory_mb = [math]::Round($p2.WorkingSet64 / 1MB, 2)
+            memory_percent = $memPct
+        }}
+    }}
+}}
+
+# Step 5: Output as JSON
+$output = @{{
+    success = $true
+    vm_name = "{vm_name}"
+    os_type = "windows"
+    sample_seconds = $SampleSeconds
+    cpu_cores = $cpuCount
+    total_memory_gb = [math]::Round($totalMem / 1GB, 2)
+    processes = @($result | Sort-Object -Property cpu_percent -Descending | Select-Object -First $TopN)
+}}
+
+$output | ConvertTo-Json -Depth 3
+"""
+            command_id = "RunPowerShellScript"
+        else:
+            # Linux bash script
+            script = f"""
+#!/bin/bash
+
+SAMPLE_SECONDS={sample_seconds}
+TOP_N={top_n}
+
+# Get CPU cores
+CPU_CORES=$(nproc)
+
+# Get total memory in bytes
+TOTAL_MEM=$(grep MemTotal /proc/meminfo | awk '{{print $2 * 1024}}')
+TOTAL_MEM_GB=$(echo "scale=2; $TOTAL_MEM / 1024 / 1024 / 1024" | bc)
+
+# Function to get process stats
+get_proc_stats() {{
+    ps -eo pid,comm,pcpu,pmem,rss --sort=-pcpu | tail -n +2
+}}
+
+# First snapshot
+PROC1=$(get_proc_stats)
+
+sleep $SAMPLE_SECONDS
+
+# Second snapshot
+PROC2=$(get_proc_stats)
+
+# Build JSON output
+echo '{{
+  "success": true,
+  "vm_name": "{vm_name}",
+  "os_type": "linux",
+  "sample_seconds": '$SAMPLE_SECONDS',
+  "cpu_cores": '$CPU_CORES',
+  "total_memory_gb": '$TOTAL_MEM_GB',
+  "processes": ['
+
+# Parse top N processes
+FIRST=true
+echo "$PROC2" | head -n $TOP_N | while IFS= read -r line; do
+    PID=$(echo $line | awk '{{print $1}}')
+    PNAME=$(echo $line | awk '{{print $2}}')
+    CPU=$(echo $line | awk '{{print $3}}')
+    MEM_PCT=$(echo $line | awk '{{print $4}}')
+    RSS=$(echo $line | awk '{{print $5}}')
+    MEM_MB=$(echo "scale=2; $RSS / 1024" | bc)
+    
+    if [ "$FIRST" = false ]; then
+        echo ','
+    fi
+    FIRST=false
+    
+    echo '    {{'
+    echo '      "process_name": "'$PNAME'",'
+    echo '      "pid": '$PID','
+    echo '      "cpu_percent": '$CPU','
+    echo '      "memory_mb": '$MEM_MB','
+    echo '      "memory_percent": '$MEM_PCT
+    echo '    }}'
+done
+
+echo '
+  ]
+}}'
+"""
+            command_id = "RunShellScript"
+        
+        # Execute the command via Azure Run Command
+        run_command_result = azure_creds.compute_client.virtual_machines.begin_run_command(
+            resource_group,
+            vm_name,
+            {
+                "command_id": command_id,
+                "script": [script]
+            }
+        ).result()
+        
+        # Extract output
+        output = ""
+        error_output = ""
+        
+        if run_command_result.value:
+            for result in run_command_result.value:
+                if result.code == "ComponentStatus/StdOut/succeeded":
+                    output += result.message or ""
+                elif result.code == "ComponentStatus/StdErr/succeeded":
+                    error_output += result.message or ""
+        
+        # Try to parse and return JSON output
+        if output:
+            try:
+                # Validate JSON
+                json_data = json.loads(output)
+                return json.dumps(json_data, indent=2)
+            except json.JSONDecodeError:
+                # If not valid JSON, wrap it
+                return json.dumps({
+                    "success": False,
+                    "error": "Failed to parse output as JSON",
+                    "raw_output": output,
+                    "error_output": error_output
+                })
+        else:
+            return json.dumps({
+                "success": False,
+                "error": "No output received from VM",
+                "error_output": error_output
+            })
+        
+    except Exception as e:
+        error_msg = {"success": False, "error": f"Failed to get process utilization: {str(e)}"}
+        logger.error(f"Failed to get process utilization for VM '{vm_name}': {str(e)}")
+        return json.dumps(error_msg)
+
+
+@app.tool()
 async def restart_vm(resource_group: str, vm_name: str) -> str:
     """
     Restart an existing Azure Virtual Machine
@@ -486,6 +686,7 @@ async def run_http(host: str = "localhost", port: int = 8000):
     # Register the same tools on the HTTP app
     http_app.add_tool(deploy_vm)
     http_app.add_tool(restart_service)
+    http_app.add_tool(get_process_utilization)
     http_app.add_tool(restart_vm)
     
     # Run with streamable HTTP transport
