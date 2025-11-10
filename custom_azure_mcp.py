@@ -6,6 +6,7 @@ Dual-transport architecture supporting both stdio and HTTP
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,18 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Setup logging - log to file to avoid interfering with MCP stdio communication
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('azure_mcp_server.log'),
+        # Only add console handler for HTTP transport (not stdio)
+        # Will be configured per transport in main()
+    ]
+)
+logger = logging.getLogger('azure_mcp_server')
 
 class AzureCredentials:
     """Manages Azure authentication and clients"""
@@ -82,10 +95,10 @@ async def deploy_vm(
         
     if os_type not in ["linux", "windows"]:
         return "❌ Error: os_type must be 'linux' or 'windows'"
-        
+    
     try:
         # Step 1: Create Resource Group
-        print(f"Creating resource group: {resource_group}", file=sys.stderr)
+        logger.info(f"Creating resource group: {resource_group}")
         azure_creds.resource_client.resource_groups.create_or_update(
             resource_group,
             {"location": location}
@@ -93,7 +106,7 @@ async def deploy_vm(
         
         # Step 2: Create Virtual Network
         vnet_name = f"{vm_name}-vnet"
-        print(f"Creating virtual network: {vnet_name}", file=sys.stderr)
+        logger.info(f"Creating virtual network: {vnet_name}")
         
         vnet_params = {
             "location": location,
@@ -110,7 +123,7 @@ async def deploy_vm(
         
         # Step 3: Create Subnet
         subnet_name = f"{vm_name}-subnet"
-        print(f"Creating subnet: {subnet_name}", file=sys.stderr)
+        logger.info(f"Creating subnet: {subnet_name}")
         
         subnet_params = {
             "address_prefix": "10.0.0.0/24"
@@ -125,7 +138,7 @@ async def deploy_vm(
         
         # Step 4: Create Public IP Address
         public_ip_name = f"{vm_name}-ip"
-        print(f"Creating public IP: {public_ip_name}", file=sys.stderr)
+        logger.info(f"Creating public IP: {public_ip_name}")
         
         public_ip_params = {
             "location": location,
@@ -142,7 +155,7 @@ async def deploy_vm(
         
         # Step 5: Create Network Interface
         nic_name = f"{vm_name}-nic"
-        print(f"Creating network interface: {nic_name}", file=sys.stderr)
+        logger.info(f"Creating network interface: {nic_name}")
         
         nic_params = {
             "location": location,
@@ -176,7 +189,7 @@ async def deploy_vm(
             }
         
         # Step 7: Create Virtual Machine
-        print(f"Creating virtual machine: {vm_name}", file=sys.stderr)
+        logger.info(f"Creating virtual machine: {vm_name}")
         
         vm_params = {
             "location": location,
@@ -248,8 +261,168 @@ Connection Info:"""
         
     except Exception as e:
         error_msg = f"❌ Failed to deploy VM '{vm_name}': {str(e)}"
-        print(error_msg, file=sys.stderr)
+        logger.error(f"Failed to deploy VM '{vm_name}': {str(e)}")
         return error_msg
+
+@app.tool()
+async def restart_service(
+    resource_group: str,
+    vm_name: str,
+    service_name: str,
+    os_type: str = "windows"
+) -> str:
+    """
+    Restart a service inside an Azure VM (like Tomcat, SQL Server, IIS, nginx, etc.)
+    
+    Args:
+        resource_group: Resource group containing the VM
+        vm_name: Name of the virtual machine
+        service_name: Name of the service to restart (e.g., 'tomcat', 'MSSQLSERVER', 'nginx')
+        os_type: Operating system type - 'windows' or 'linux' (default: windows)
+        
+    Returns:
+        Result of the service restart operation
+    """
+    if not azure_creds:
+        return "❌ Error: Azure credentials not initialized"
+        
+    if not resource_group or not vm_name or not service_name:
+        return "❌ Error: resource_group, vm_name, and service_name are required"
+    
+    if os_type.lower() not in ["windows", "linux"]:
+        return "❌ Error: os_type must be 'windows' or 'linux'"
+    
+    try:
+        logger.info(f"Restarting service '{service_name}' on VM: {vm_name}")
+        
+        # Build appropriate command based on OS type
+        if os_type.lower() == "windows":
+            # Windows PowerShell command
+            script = f"""
+$serviceName = "{service_name}"
+
+Write-Host "=== SERVICE RESTART ==="
+Write-Host "Service: $serviceName"
+Write-Host "VM: {vm_name}"
+Write-Host ""
+
+# Check if service exists
+$service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+
+if ($null -eq $service) {{
+    Write-Host "❌ Service '$serviceName' not found on this VM"
+    Write-Host ""
+    Write-Host "Available services:"
+    Get-Service | Where-Object {{ $_.Status -eq 'Running' }} | Select-Object -First 10 Name, DisplayName | Format-Table -AutoSize
+    exit 1
+}}
+
+Write-Host "Current status: $($service.Status)"
+Write-Host ""
+
+# Restart the service
+try {{
+    Write-Host "🔄 Restarting service..."
+    Restart-Service -Name $serviceName -Force -ErrorAction Stop
+    Start-Sleep -Seconds 2
+    
+    # Verify service is running
+    $service = Get-Service -Name $serviceName
+    
+    if ($service.Status -eq 'Running') {{
+        Write-Host "✅ Service restarted successfully!"
+        Write-Host "New status: $($service.Status)"
+    }} else {{
+        Write-Host "⚠️  Service restarted but status is: $($service.Status)"
+    }}
+}} catch {{
+    Write-Host "❌ Failed to restart service: $($_.Exception.Message)"
+    exit 1
+}}
+"""
+            command_id = "RunPowerShellScript"
+        else:
+            # Linux bash command
+            script = f"""
+#!/bin/bash
+
+SERVICE_NAME="{service_name}"
+
+echo "=== SERVICE RESTART ==="
+echo "Service: $SERVICE_NAME"
+echo "VM: {vm_name}"
+echo ""
+
+# Check if service exists
+if ! systemctl list-units --type=service --all | grep -q "$SERVICE_NAME.service"; then
+    echo "❌ Service '$SERVICE_NAME' not found on this VM"
+    echo ""
+    echo "Available services:"
+    systemctl list-units --type=service --state=running | head -n 15
+    exit 1
+fi
+
+# Get current status
+echo "Current status:"
+systemctl status $SERVICE_NAME --no-pager | head -n 5
+echo ""
+
+# Restart the service
+echo "🔄 Restarting service..."
+if systemctl restart $SERVICE_NAME; then
+    sleep 2
+    
+    # Verify service is running
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        echo "✅ Service restarted successfully!"
+        echo "New status:"
+        systemctl status $SERVICE_NAME --no-pager | head -n 5
+    else
+        echo "⚠️  Service restarted but may not be running properly"
+        systemctl status $SERVICE_NAME --no-pager | head -n 10
+    fi
+else
+    echo "❌ Failed to restart service"
+    systemctl status $SERVICE_NAME --no-pager
+    exit 1
+fi
+"""
+            command_id = "RunShellScript"
+        
+        # Execute the command via Azure Run Command
+        run_command_result = azure_creds.compute_client.virtual_machines.begin_run_command(
+            resource_group,
+            vm_name,
+            {
+                "command_id": command_id,
+                "script": [script]
+            }
+        ).result()
+        
+        # Extract output
+        output = ""
+        error_output = ""
+        
+        if run_command_result.value:
+            for result in run_command_result.value:
+                if result.code == "ComponentStatus/StdOut/succeeded":
+                    output += result.message or ""
+                elif result.code == "ComponentStatus/StdErr/succeeded":
+                    error_output += result.message or ""
+        
+        # Determine success based on output
+        if output and ("✅" in output or "successfully" in output.lower()):
+            return f"✅ Service Restart Completed for '{service_name}' on VM '{vm_name}':\n\n{output}"
+        elif "❌" in output or error_output:
+            return f"❌ Service Restart Failed for '{service_name}' on VM '{vm_name}':\n\n{output}\n{error_output if error_output else ''}"
+        else:
+            return f"⚠️  Service Restart Status for '{service_name}' on VM '{vm_name}':\n\n{output}"
+        
+    except Exception as e:
+        error_msg = f"❌ Failed to restart service '{service_name}' on VM '{vm_name}': {str(e)}"
+        logger.error(f"Failed to restart service '{service_name}' on VM '{vm_name}': {str(e)}")
+        return error_msg
+
 
 @app.tool()
 async def restart_vm(resource_group: str, vm_name: str) -> str:
@@ -271,14 +444,14 @@ async def restart_vm(resource_group: str, vm_name: str) -> str:
     
     try:
         # Verify VM exists
-        print(f"Verifying VM exists: {vm_name}", file=sys.stderr)
+        logger.info(f"Verifying VM exists: {vm_name}")
         vm = azure_creds.compute_client.virtual_machines.get(
             resource_group,
             vm_name
         )
         
         # Initiate restart operation
-        print(f"Restarting VM: {vm_name}", file=sys.stderr)
+        logger.info(f"Restarting VM: {vm_name}")
         restart_operation = azure_creds.compute_client.virtual_machines.begin_restart(
             resource_group,
             vm_name
@@ -291,27 +464,28 @@ async def restart_vm(resource_group: str, vm_name: str) -> str:
         
     except Exception as e:
         error_msg = f"❌ Failed to restart VM '{vm_name}': {str(e)}"
-        print(error_msg, file=sys.stderr)
+        logger.error(f"Failed to restart VM '{vm_name}': {str(e)}")
         return error_msg
 
 
 async def run_stdio():
     """Run the MCP server with stdio transport"""
-    print("Starting Custom Azure MCP Server (stdio)...", file=sys.stderr)
-    print(f"Subscription: {azure_creds.subscription_id if azure_creds else 'Not initialized'}", file=sys.stderr)
+    logger.info("Starting Custom Azure MCP Server (stdio)...")
+    logger.info(f"Subscription: {azure_creds.subscription_id if azure_creds else 'Not initialized'}")
     await app.run_stdio_async()
 
 
 async def run_http(host: str = "localhost", port: int = 8000):
     """Run the MCP server with HTTP transport"""
-    print(f"Starting Custom Azure MCP Server (HTTP) on {host}:{port}...", file=sys.stderr)
-    print(f"Subscription: {azure_creds.subscription_id if azure_creds else 'Not initialized'}", file=sys.stderr)
+    logger.info(f"Starting Custom Azure MCP Server (HTTP) on {host}:{port}...")
+    logger.info(f"Subscription: {azure_creds.subscription_id if azure_creds else 'Not initialized'}")
     
     # Create new FastMCP instance with proper host/port
     http_app = FastMCP(name="custom-azure-mcp", host=host, port=port)
     
     # Register the same tools on the HTTP app
     http_app.add_tool(deploy_vm)
+    http_app.add_tool(restart_service)
     http_app.add_tool(restart_vm)
     
     # Run with streamable HTTP transport
@@ -339,12 +513,21 @@ def main():
     subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
     
     if not all([tenant_id, client_id, client_secret, subscription_id]):
+        # For missing credentials, we can safely print to stderr as this happens before MCP starts
         print("Error: Missing required environment variables:", file=sys.stderr)
         print("  - AZURE_TENANT_ID", file=sys.stderr)
         print("  - AZURE_CLIENT_ID", file=sys.stderr)
         print("  - AZURE_CLIENT_SECRET", file=sys.stderr)
         print("  - AZURE_SUBSCRIPTION_ID", file=sys.stderr)
         sys.exit(1)
+    
+    # Configure logging based on transport
+    if args.transport == 'http':
+        # For HTTP transport, we can safely add console logging
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(console_handler)
     
     # Initialize Azure credentials
     azure_creds = AzureCredentials(
@@ -361,7 +544,9 @@ def main():
         else:  # http
             asyncio.run(run_http(host=args.host, port=args.port))
     except KeyboardInterrupt:
-        print("\nShutting down...", file=sys.stderr)
+        logger.info("Shutting down server...")
+        if args.transport == 'http':
+            print("\nShutting down...", file=sys.stderr)  # Safe for HTTP transport
 
 
 if __name__ == "__main__":

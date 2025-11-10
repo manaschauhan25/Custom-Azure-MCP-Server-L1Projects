@@ -68,6 +68,12 @@ python custom_azure_mcp.py --help
 python custom_azure_mcp.py --transport http
 ```
 
+### Logging
+The server uses Python logging to avoid interfering with MCP stdio communication:
+- **Log file**: `azure_mcp_server.log` (always created)
+- **Console logging**: Only enabled for HTTP transport
+- **stdio transport**: Logs only to file to prevent MCP protocol interference
+
 ## Architecture
 
 ### Core Dependencies
@@ -98,7 +104,12 @@ python custom_azure_mcp.py --transport http
   - Required: `resource_group`, `vm_name`, `admin_password`
   - Optional: `location` (default: eastus), `vm_size` (default: Standard_B2s), `admin_username` (default: azureuser), `os_type` (default: linux)
   - Supports: Linux (Ubuntu 22.04), Windows (Server 2022)
-- `restart_vm` - Restart existing virtual machines
+- `restart_service` - Restart a service inside a running VM (Tomcat, SQL Server, IIS, nginx, etc.)
+  - Required: `resource_group`, `vm_name`, `service_name`
+  - Optional: `os_type` (default: windows) - windows or linux
+  - Uses Azure Run Command to execute restart inside the VM
+  - Verifies service status after restart
+- `restart_vm` - Restart entire virtual machine
   - Required: `resource_group`, `vm_name`
 
 #### VM Deployment Features
