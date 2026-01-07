@@ -19,6 +19,9 @@ from azure.mgmt.resource import ResourceManagementClient
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
+import subprocess
+import shlex
+
 # Load environment variables
 load_dotenv()
 
@@ -426,6 +429,123 @@ fi
 
 
 @app.tool()
+async def check_service_status(
+    resource_group: str,
+    vm_name: str,
+    service_name: str,
+    os_type: str = "windows"
+) -> str:
+    """
+    Check the status of a service inside an Azure VM (Tomcat, IIS, SQL, nginx, etc.)
+    """
+    if not azure_creds:
+        return "❌ Error: Azure credentials not initialized"
+
+    try:
+        if os_type.lower() == "windows":
+            script = f"""
+$inputName = "{service_name}"
+
+$svc = Get-Service | Where-Object {{
+    $_.Name -like "*$inputName*" -or $_.DisplayName -like "*$inputName*"
+}}
+
+if (-not $svc) {{
+    Write-Output "FOUND=false"
+    Write-Output "STATUS=NOT_FOUND"
+    exit 1
+}}
+
+Write-Output "FOUND=true"
+Write-Output "SERVICE_NAME=$($svc.Name)"
+Write-Output "DISPLAY_NAME=$($svc.DisplayName)"
+Write-Output "STATE=$($svc.Status)"
+
+if ($svc.Status -eq "Running") {{
+    Write-Output "STATUS=RUNNING"
+}} elseif ($svc.Status -eq "Stopped") {{
+    Write-Output "STATUS=STOPPED"
+}} else {{
+    Write-Output "STATUS=$($svc.Status)"
+}}
+"""
+            command_id = "RunPowerShellScript"
+
+        else:
+            script = f"""
+#!/bin/bash
+SERVICE="{service_name}"
+
+if systemctl list-units --type=service --all | grep -q "$SERVICE"; then
+    STATE=$(systemctl is-active "$SERVICE" || true)
+    echo "FOUND=true"
+    echo "SERVICE_NAME=$SERVICE"
+    echo "STATE=$STATE"
+
+    if [ "$STATE" = "active" ]; then
+        echo "STATUS=RUNNING"
+    else
+        echo "STATUS=$STATE"
+    fi
+else
+    echo "FOUND=false"
+    echo "STATUS=NOT_FOUND"
+    exit 1
+fi
+"""
+            command_id = "RunShellScript"
+
+        result = azure_creds.compute_client.virtual_machines.begin_run_command(
+            resource_group,
+            vm_name,
+            {
+                "command_id": command_id,
+                "script": [script]
+            }
+        ).result()
+
+        stdout = ""
+        stderr = ""
+
+        for item in result.value:
+            if item.code.endswith("StdOut/succeeded"):
+                stdout += item.message or ""
+            elif item.code.endswith("StdErr/succeeded"):
+                stderr += item.message or ""
+
+        # -------- PARSE OUTPUT (IMPORTANT) --------
+        data = {}
+        for line in stdout.splitlines():
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                data[k] = v
+
+        if not data:
+            return json.dumps({
+                "success": False,
+                "error": "No structured output from VM",
+                "raw_output": stdout,
+                "stderr": stderr
+            }, indent=2)
+
+        return json.dumps({
+            "success": True if data.get("FOUND") == "true" else False,
+            "vm_name": vm_name,
+            "service_input": service_name,
+            "resolved_service": data.get("SERVICE_NAME"),
+            "display_name": data.get("DISPLAY_NAME"),
+            "state": data.get("STATE"),
+            "status": data.get("STATUS")
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+
+@app.tool()
 async def get_process_utilization(
     resource_group: str,
     vm_name: str,
@@ -435,149 +555,75 @@ async def get_process_utilization(
 ) -> str:
     """
     Get top CPU and Memory consuming processes on an Azure VM
-    
-    Args:
-        resource_group: Resource group containing the VM
-        vm_name: Name of the virtual machine
-        os_type: Operating system type - 'windows' or 'linux' (default: windows)
-        sample_seconds: Sampling period in seconds (default: 5)
-        top_n: Number of top processes to return (default: 15)
-        
-    Returns:
-        JSON string with process utilization data
+    (TABLE output – safe for Azure Run Command)
     """
     if not azure_creds:
-        return json.dumps({"error": "Azure credentials not initialized", "success": False})
-        
+        return "❌ Error: Azure credentials not initialized"
+
     if not resource_group or not vm_name:
-        return json.dumps({"error": "resource_group and vm_name are required", "success": False})
-    
+        return "❌ Error: resource_group and vm_name are required"
+
     if os_type.lower() not in ["windows", "linux"]:
-        return json.dumps({"error": "os_type must be 'windows' or 'linux'", "success": False})
-    
+        return "❌ Error: os_type must be 'windows' or 'linux'"
+
     try:
         logger.info(f"Getting process utilization for VM: {vm_name}")
-        
-        # Build appropriate script based on OS type
+
+        # ---------------- WINDOWS ----------------
         if os_type.lower() == "windows":
-            # Windows PowerShell script
             script = f"""
 $SampleSeconds = {sample_seconds}
 $TopN = {top_n}
 
-# Step 1: First snapshot
-$proc1 = Get-Process | Select-Object Id, Name, CPU, WorkingSet64
-
+$p1 = Get-Process | Select-Object Id, Name, CPU, WorkingSet64
 Start-Sleep -Seconds $SampleSeconds
+$p2 = Get-Process | Select-Object Id, Name, CPU, WorkingSet64
 
-# Step 2: Second snapshot
-$proc2 = Get-Process | Select-Object Id, Name, CPU, WorkingSet64
-
-# Step 3: System resource details
 $cpuCount = (Get-WmiObject Win32_ComputerSystem).NumberOfLogicalProcessors
-$totalMem = (Get-WmiObject Win32_OperatingSystem).TotalVisibleMemorySize * 1KB
 
-# Step 4: Compute CPU & Memory%
-$result = foreach ($p2 in $proc2) {{
-    $p1 = $proc1 | Where-Object {{ $_.Id -eq $p2.Id }}
-    if ($p1 -and $p2.CPU -ne $null) {{
-        $cpuDelta = ($p2.CPU - $p1.CPU)
-        $cpuPct = [math]::Round(($cpuDelta / $SampleSeconds / $cpuCount) * 100, 2)
-        $memPct = [math]::Round(($p2.WorkingSet64 / $totalMem) * 100, 2)
+$result = foreach ($p in $p2) {{
+    $old = $p1 | Where-Object {{ $_.Id -eq $p.Id }}
+    if ($old -and $p.CPU -ne $null) {{
+        $cpuDelta = ($p.CPU - $old.CPU)
         [PSCustomObject]@{{
-            process_name = $p2.Name
-            pid = $p2.Id
-            cpu_percent = $cpuPct
-            memory_mb = [math]::Round($p2.WorkingSet64 / 1MB, 2)
-            memory_percent = $memPct
+            Process = $p.Name
+            PID = $p.Id
+            CPU_Percent = [math]::Round(($cpuDelta / $SampleSeconds / $cpuCount) * 100, 2)
+            Memory_MB = [math]::Round($p.WorkingSet64 / 1MB, 2)
         }}
     }}
 }}
 
-# Step 5: Output as JSON
-$output = @{{
-    success = $true
-    vm_name = "{vm_name}"
-    os_type = "windows"
-    sample_seconds = $SampleSeconds
-    cpu_cores = $cpuCount
-    total_memory_gb = [math]::Round($totalMem / 1GB, 2)
-    processes = @($result | Sort-Object -Property cpu_percent -Descending | Select-Object -First $TopN)
-}}
+Write-Output ""
+Write-Output "Top $TopN Processes (CPU & Memory)"
+Write-Output "--------------------------------"
 
-$output | ConvertTo-Json -Depth 3
+$result |
+    Sort-Object CPU_Percent -Descending |
+    Select-Object -First $TopN |
+    Format-Table -AutoSize
 """
             command_id = "RunPowerShellScript"
+
+        # ---------------- LINUX ----------------
         else:
-            # Linux bash script
             script = f"""
 #!/bin/bash
 
-SAMPLE_SECONDS={sample_seconds}
 TOP_N={top_n}
 
-# Get CPU cores
-CPU_CORES=$(nproc)
+echo ""
+echo "Top $TOP_N Processes (CPU & Memory)"
+echo "--------------------------------"
 
-# Get total memory in bytes
-TOTAL_MEM=$(grep MemTotal /proc/meminfo | awk '{{print $2 * 1024}}')
-TOTAL_MEM_GB=$(echo "scale=2; $TOTAL_MEM / 1024 / 1024 / 1024" | bc)
-
-# Function to get process stats
-get_proc_stats() {{
-    ps -eo pid,comm,pcpu,pmem,rss --sort=-pcpu | tail -n +2
-}}
-
-# First snapshot
-PROC1=$(get_proc_stats)
-
-sleep $SAMPLE_SECONDS
-
-# Second snapshot
-PROC2=$(get_proc_stats)
-
-# Build JSON output
-echo '{{
-  "success": true,
-  "vm_name": "{vm_name}",
-  "os_type": "linux",
-  "sample_seconds": '$SAMPLE_SECONDS',
-  "cpu_cores": '$CPU_CORES',
-  "total_memory_gb": '$TOTAL_MEM_GB',
-  "processes": ['
-
-# Parse top N processes
-FIRST=true
-echo "$PROC2" | head -n $TOP_N | while IFS= read -r line; do
-    PID=$(echo $line | awk '{{print $1}}')
-    PNAME=$(echo $line | awk '{{print $2}}')
-    CPU=$(echo $line | awk '{{print $3}}')
-    MEM_PCT=$(echo $line | awk '{{print $4}}')
-    RSS=$(echo $line | awk '{{print $5}}')
-    MEM_MB=$(echo "scale=2; $RSS / 1024" | bc)
-    
-    if [ "$FIRST" = false ]; then
-        echo ','
-    fi
-    FIRST=false
-    
-    echo '    {{'
-    echo '      "process_name": "'$PNAME'",'
-    echo '      "pid": '$PID','
-    echo '      "cpu_percent": '$CPU','
-    echo '      "memory_mb": '$MEM_MB','
-    echo '      "memory_percent": '$MEM_PCT
-    echo '    }}'
-done
-
-echo '
-  ]
-}}'
+ps -eo pid,comm,%cpu,%mem --sort=-%cpu |
+head -n $((TOP_N + 1)) |
+awk '{{printf "%-8s %-20s %-10s %-10s\\n", $1, $2, $3, $4}}'
 """
             command_id = "RunShellScript"
-        
-        # Execute the command via Azure Run Command
-        run_command_result = azure_creds.compute_client.virtual_machines.begin_run_command(
+
+        # -------- Execute via Azure Run Command --------
+        result = azure_creds.compute_client.virtual_machines.begin_run_command(
             resource_group,
             vm_name,
             {
@@ -585,44 +631,29 @@ echo '
                 "script": [script]
             }
         ).result()
-        
-        # Extract output
-        output = ""
-        error_output = ""
-        
-        if run_command_result.value:
-            for result in run_command_result.value:
-                if result.code == "ComponentStatus/StdOut/succeeded":
-                    output += result.message or ""
-                elif result.code == "ComponentStatus/StdErr/succeeded":
-                    error_output += result.message or ""
-        
-        # Try to parse and return JSON output
-        if output:
-            try:
-                # Validate JSON
-                json_data = json.loads(output)
-                return json.dumps(json_data, indent=2)
-            except json.JSONDecodeError:
-                # If not valid JSON, wrap it
-                return json.dumps({
-                    "success": False,
-                    "error": "Failed to parse output as JSON",
-                    "raw_output": output,
-                    "error_output": error_output
-                })
-        else:
-            return json.dumps({
-                "success": False,
-                "error": "No output received from VM",
-                "error_output": error_output
-            })
-        
-    except Exception as e:
-        error_msg = {"success": False, "error": f"Failed to get process utilization: {str(e)}"}
-        logger.error(f"Failed to get process utilization for VM '{vm_name}': {str(e)}")
-        return json.dumps(error_msg)
 
+        stdout = ""
+        stderr = ""
+
+        for item in result.value:
+            if item.code.endswith("StdOut/succeeded"):
+                stdout += item.message or ""
+            elif item.code.endswith("StdErr/succeeded"):
+                stderr += item.message or ""
+
+        if not stdout.strip():
+            return f"⚠️ No process data returned from VM '{vm_name}'"
+
+        return f"""
+Process Utilization for VM: {vm_name}
+OS Type: {os_type}
+
+{stdout}
+"""
+
+    except Exception as e:
+        logger.error(f"Process utilization failed for VM '{vm_name}': {str(e)}")
+        return f"❌ Failed to get process utilization: {str(e)}"
 
 @app.tool()
 async def restart_vm(resource_group: str, vm_name: str) -> str:
@@ -667,7 +698,86 @@ async def restart_vm(resource_group: str, vm_name: str) -> str:
         logger.error(f"Failed to restart VM '{vm_name}': {str(e)}")
         return error_msg
 
+# @app.tool()
+# async def run_azure_cli(
+#     command: str,
+#     timeout_seconds: int = 120
+# ) -> str:
+#     """
+#     Run any Azure CLI (az) command on the MCP server host.
 
+#     Args:
+#         command: Azure CLI command (must start with 'az')
+#                  Example:
+#                    az vm list -o table
+#                    az group show -n my-rg
+#         timeout_seconds: Max execution time (default 120s)
+
+#     Returns:
+#         Command output (stdout / stderr)
+#     """
+
+#     if not command:
+#         return "❌ Error: command is required"
+
+#     command = command.strip()
+
+#     # 🔐 Security: allow ONLY az commands
+#     if not command.startswith("az "):
+#         return "❌ Error: Only Azure CLI commands starting with 'az' are allowed"
+
+#     logger.info(f"Executing Azure CLI command: {command}")
+
+#     try:
+#         # Split safely (prevents shell injection)
+#         cmd_args = shlex.split(command)
+
+#         process = subprocess.run(
+#             cmd_args,
+#             stdout=subprocess.PIPE,
+#             stderr=subprocess.PIPE,
+#             timeout=timeout_seconds,
+#             text=True
+#         )
+
+#         stdout = process.stdout.strip()
+#         stderr = process.stderr.strip()
+
+#         if process.returncode == 0:
+#             return f"""✅ Azure CLI command executed successfully
+
+#             Command:
+#             {command}
+
+#             Output:
+#             {stdout if stdout else "(no output)"}
+#             """
+#         else:
+#             return f"""❌ Azure CLI command failed
+
+#             Command:
+#             {command}
+
+#             Exit Code:
+#             {process.returncode}
+
+#             Error:
+#             {stderr if stderr else "(no error output)"}
+#             """
+
+#     except subprocess.TimeoutExpired:
+#         return f"❌ Command timed out after {timeout_seconds} seconds"
+
+#     except FileNotFoundError:
+#         return (
+#             "❌ Azure CLI not found on server.\n"
+#             "Make sure Azure CLI is installed and available in PATH."
+#         )
+
+#     except Exception as e:
+#         logger.exception("Azure CLI execution failed")
+#         return f"❌ Unexpected error while executing Azure CLI command: {str(e)}"
+        
 async def run_stdio():
     """Run the MCP server with stdio transport"""
     logger.info("Starting Custom Azure MCP Server (stdio)...")
@@ -686,8 +796,11 @@ async def run_http(host: str = "localhost", port: int = 8000):
     # Register the same tools on the HTTP app
     http_app.add_tool(deploy_vm)
     http_app.add_tool(restart_service)
+    http_app.add_tool(check_service_status)
     http_app.add_tool(get_process_utilization)
     http_app.add_tool(restart_vm)
+    # http_app.add_tool(run_azure_cli)
+
     
     # Run with streamable HTTP transport
     await http_app.run_streamable_http_async()
